@@ -7589,15 +7589,15 @@ MainMenu.prototype.drawUI = function (u) {
    (Supabase → Project Settings → API). Laisse vide pour la saisir dans le jeu.
    ========================================================= */
 const SUPABASE_URL = 'https://ihxloswpvaqzkjreakat.supabase.co';
-const SUPABASE_ANON_KEY = 'sb_publishable_PB5j2X-T3xf6T2gAbBh6_Q_d2TObS-b';
-const SUPABASE_JS = ['https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.4/dist/umd/supabase.min.js', 'https://unpkg.com/@supabase/supabase-js@2.49.4/dist/umd/supabase.min.js', 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js'];
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImloeGxvc3dwdmFxemtqcmVha2F0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTIwMDQ4OTksImV4cCI6MjEwNzU4MDg5OX0.hLXJ5sq8LvQpBH2KF15zOxQKCvFgVNvYzILSk0fwoY8';
+const SUPABASE_JS = ['https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2', 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.4/dist/umd/supabase.min.js', 'https://unpkg.com/@supabase/supabase-js@2.49.4/dist/umd/supabase.min.js', 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js'];
 
 function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
 const NET = { tr: null, role: null, code: '', name: '', peer: null, onMsg: null, lastRx: 0, rtt: 120, local: false, scene: null };
 // nettoie ce qui a été collé : garde seulement https://xxxx.supabase.co et la clé (sb_publishable_… ou eyJ…)
 function cleanUrl(u) { u = String(u || '').trim(); const m = u.match(/https?:\/\/[a-z0-9-]+\.supabase\.(co|in|net)/i) || u.match(/https?:\/\/[^\s'"\/]+/i); return m ? m[0].replace(/\/+$/, '') : ''; }
 function cleanKey(k) { k = String(k || '').trim(); const m = k.match(/sb_publishable_[A-Za-z0-9_-]+|eyJ[A-Za-z0-9._-]+/); return m ? m[0] : k.replace(/['"\s;]/g, ''); }
-function netCfg() { let c = {}; try { c = JSON.parse(localStorage.getItem('asf_supa') || '{}'); } catch (e) { } return { url: cleanUrl(SUPABASE_URL || c.url), key: cleanKey(SUPABASE_ANON_KEY || c.key) }; }
+function netCfg() { let c = {}; try { c = JSON.parse(localStorage.getItem('asf_supa') || '{}'); } catch (e) { } return { url: cleanUrl(c.url || SUPABASE_URL), key: cleanKey(c.key || SUPABASE_ANON_KEY) }; }
 function loadOne(src) { return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = () => { s.remove(); rej(); }; document.head.appendChild(s); }); }
 async function loadScript(list) { if (window.supabase && window.supabase.createClient) return; for (const src of list) { try { await loadOne(src); if (window.supabase && window.supabase.createClient) return; } catch (e) { } } throw new Error('Impossible de charger supabase-js (connexion internet ?)'); }
 
@@ -7616,7 +7616,7 @@ class SupaTransport {
     this.client = window.supabase.createClient(c.url, c.key, { realtime: { params: { eventsPerSecond: 60 } } });
     this.ch = this.client.channel('asf-' + this.code, { config: { broadcast: { self: false, ack: false } } });
     this.ch.on('broadcast', { event: 'm' }, ({ payload }) => this.cb && this.cb(payload));
-    await new Promise((res, rej) => { const to = setTimeout(() => rej(new Error('Connexion Supabase trop lente')), 10000); this.ch.subscribe(st => { if (st === 'SUBSCRIBED') { clearTimeout(to); res(); } else if (st === 'CHANNEL_ERROR' || st === 'TIMED_OUT') { clearTimeout(to); rej(new Error('Canal Supabase : ' + st)); } }); });
+    await new Promise((res, rej) => { const to = setTimeout(() => rej(new Error('Connexion Supabase trop lente')), 10000); this.ch.subscribe((st, err) => { if (st === 'SUBSCRIBED') { clearTimeout(to); res(); } else if (st === 'CHANNEL_ERROR' || st === 'TIMED_OUT' || st === 'CLOSED') { clearTimeout(to); const d = err && (err.message || err.reason || JSON.stringify(err)); console.error('Supabase realtime', st, err); rej(new Error('Canal Supabase : ' + st + (d ? ' — ' + d : '') + (location.protocol === 'file:' ? ' (ouvre le jeu depuis GitHub Pages, pas en fichier local)' : ''))); } }); });
     return true;
   }
   send(m) { try { this.ch.send({ type: 'broadcast', event: 'm', payload: m }); } catch (e) { } }
@@ -7696,11 +7696,11 @@ class NetLobby {
   render() {
     if (!this.el) return; const cfg = netCfg(); let h = `<div class="pn"><h1>EN LIGNE</h1><small>Combat 1 contre 1 à distance. Chaque joueur utilise les touches du JOUEUR 1 (ou sa manette).</small>`;
     if (!NET.tr) {
-      if (!cfg.url || !cfg.key) h += `<h2>CONFIG SUPABASE</h2><div class="row"><input id="nurl" placeholder="https://xxxx.supabase.co" style="flex:2" value="${cfg.url}"><input id="nkey" placeholder="clé anon public" style="flex:3" value="${cfg.key}"><button id="nsave" class="alt">ENREGISTRER</button></div><small>Supabase → Project Settings → API. (Ou colle-les une fois pour toutes en haut du fichier, voir SUPABASE_URL.)</small>`;
+      if (!cfg.url || !cfg.key || this.showCfg) h += `<h2>CONFIG SUPABASE</h2><div class="row"><input id="nurl" placeholder="https://xxxx.supabase.co" style="flex:2" value="${cfg.url}"><input id="nkey" placeholder="clé anon public" style="flex:3" value="${cfg.key}"><button id="nsave" class="alt">ENREGISTRER</button></div><small>Supabase → Project Settings → API. (Ou colle-les une fois pour toutes en haut du fichier, voir SUPABASE_URL.)</small>`;
       let nm = ''; try { nm = localStorage.getItem('asf_name') || ''; } catch (e) { }
       h += `<h2>TON PSEUDO</h2><div class="row"><input id="nname" maxlength="14" value="${NET.name || nm}" placeholder="Pseudo"></div>
         <h2>SALON</h2><div class="row"><button id="ncreate">CRÉER UN SALON</button><span style="margin:0 6px">ou</span><input id="ncode" maxlength="4" placeholder="CODE" style="width:90px;text-transform:uppercase;letter-spacing:4px"><button id="njoin">REJOINDRE</button></div>
-        <div class="row"><label><input type="checkbox" id="nlocal"> Test local (2 onglets sur ce PC, sans Supabase)</label></div>`;
+        <div class="row"><label><input type="checkbox" id="nlocal"> Test local (2 onglets sur ce PC, sans Supabase)</label><button id="ncfg" class="alt" style="margin-left:auto">CONFIG SUPABASE</button></div><small>Projet : ${cfg.url || '—'} · clé ${cfg.key ? cfg.key.slice(0, 16) + '…' : '—'}</small>`;
     } else {
       const f = netFaces(), opp = this.peerSel;
       h += `<div class="row" style="justify-content:space-between"><div>SALON <span class="code">${NET.code}</span></div><div>${NET.peer ? `Adversaire : <b>${NET.peer.name}</b> ${opp && opp.ready ? '<span class="ready">PRÊT</span>' : ''}` : '<i>En attente d\'un adversaire…</i>'}</div></div>`;
@@ -7713,8 +7713,8 @@ class NetLobby {
     h += `<div class="row" style="justify-content:space-between;margin-top:10px"><div id="nst" class="st"></div><button id="nback" class="alt">RETOUR</button></div></div>`;
     this.el.innerHTML = h; this.renderStatus();
     const on = (s, ev, fn) => { const e = this.q(s); if (e) e.addEventListener(ev, fn); };
-    on('#nsave', 'click', () => { try { localStorage.setItem('asf_supa', JSON.stringify({ url: cleanUrl(this.q('#nurl').value), key: cleanKey(this.q('#nkey').value) })); } catch (e) { } this.status = 'Config enregistrée.'; this.render(); });
-    on('#ncreate', 'click', () => this.connect(true)); on('#njoin', 'click', () => this.connect(false));
+    on('#nsave', 'click', () => { try { localStorage.setItem('asf_supa', JSON.stringify({ url: cleanUrl(this.q('#nurl').value), key: cleanKey(this.q('#nkey').value) })); } catch (e) { } this.showCfg = false; window.supabase = undefined; this.status = 'Config enregistrée.'; this.render(); });
+    on('#ncfg', 'click', () => { this.showCfg = !this.showCfg; this.render(); }); on('#ncreate', 'click', () => this.connect(true)); on('#njoin', 'click', () => this.connect(false));
     on('#nback', 'click', () => this.exit());
     on('#nready', 'click', () => { this.sel.ready = !this.sel.ready; this.sendSel(); this.render(); this.maybeStart(); });
     ['#nstage', '#ntime', '#nrounds'].forEach(s => on(s, 'change', () => { this.cfgStage = +this.q('#nstage').value; this.cfgTime = +this.q('#ntime').value; this.cfgRounds = +this.q('#nrounds').value; this.sendSel(); }));
