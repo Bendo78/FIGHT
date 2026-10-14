@@ -1,3 +1,5 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>All Star Fight</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -3879,6 +3881,7 @@ class Battle {
   }
   end(w) {
     if (this.ending) return; this.ending = true;
+    if (this.cfg.onEnd) return this.cfg.onEnd(w, this);
     go(new Results(this.cfg, w, this));
   }
   pushApart() {
@@ -6812,6 +6815,7 @@ class MainMenu {
     this.items = [
       { l: 'COMBAT EN ÉQUIPE', sub: [{ l: 'ÉQUIPE VS JOUEUR', go: () => new CharSelect('team') }, { l: 'ÉQUIPE VS CPU', go: () => new CharSelect('teamcpu') }] },
       { l: 'COMBAT SOLO', sub: [{ l: 'ARCADE', go: () => new CharSelect('arcade') }, { l: 'SOLO VS JOUEUR', go: () => new CharSelect('vs') }, { l: 'SOLO VS CPU', go: () => new CharSelect('cpu') }] },
+      { l: 'EN LIGNE', go: () => new NetLobby() },
       { l: 'ENTRAÎNEMENT', go: () => new CharSelect('training') },
       { l: 'ATELIER DE SKINS', go: () => new Workshop() },
       { l: 'OPTIONS', go: () => new Options() },
@@ -7578,6 +7582,208 @@ MainMenu.prototype.drawUI = function (u) {
     txt(u, 'v2.2', 472, 264, { font: F.px, size: 6, weight: 400, fill: '#8a7aa8', align: 'right' });
   }
 };
+/* =========================================================
+   MODE EN LIGNE (v23) — Supabase Realtime (Broadcast) + lockstep déterministe
+   ---------------------------------------------------------
+   ⚙️  CONFIG : colle ici l'URL et la clé "anon public" de ton projet Supabase
+   (Supabase → Project Settings → API). Laisse vide pour la saisir dans le jeu.
+   ========================================================= */
+const SUPABASE_URL = 'ihxloswpvaqzkjreakat';
+const SUPABASE_ANON_KEY = 'sb_publishable_PB5j2X-T3xf6T2gAbBh6_Q_d2TObS-b';
+const SUPABASE_JS = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js';
+
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+const NET = { tr: null, role: null, code: '', name: '', peer: null, onMsg: null, lastRx: 0, rtt: 120, local: false, scene: null };
+function netCfg() { let c = {}; try { c = JSON.parse(localStorage.getItem('asf_supa') || '{}'); } catch (e) { } return { url: SUPABASE_URL || c.url || '', key: SUPABASE_ANON_KEY || c.key || '' }; }
+function loadScript(src) { return new Promise((res, rej) => { if (window.supabase) return res(); const s = document.createElement('script'); s.src = src; s.onload = res; s.onerror = () => rej(new Error('Impossible de charger supabase-js')); document.head.appendChild(s); }); }
+
+/* ---------- transports ---------- */
+class LocalTransport { // test : 2 onglets du même navigateur
+  constructor(code) { this.bc = new BroadcastChannel('asf-' + code); this.bc.onmessage = e => this.cb && this.cb(e.data); }
+  async open() { return true; }
+  send(m) { const lag = window.NET_LAG || 0; if (lag) setTimeout(() => { try { this.bc.postMessage(m); } catch (e) { } }, lag * (.8 + Math.random() * .4)); else try { this.bc.postMessage(m); } catch (e) { } }
+  close() { try { this.bc.close(); } catch (e) { } }
+}
+class SupaTransport {
+  constructor(code) { this.code = code; }
+  async open() {
+    const c = netCfg(); if (!c.url || !c.key) throw new Error('URL / clé Supabase manquantes');
+    await loadScript(SUPABASE_JS);
+    this.client = window.supabase.createClient(c.url, c.key, { realtime: { params: { eventsPerSecond: 60 } } });
+    this.ch = this.client.channel('asf-' + this.code, { config: { broadcast: { self: false, ack: false } } });
+    this.ch.on('broadcast', { event: 'm' }, ({ payload }) => this.cb && this.cb(payload));
+    await new Promise((res, rej) => { const to = setTimeout(() => rej(new Error('Connexion Supabase trop lente')), 10000); this.ch.subscribe(st => { if (st === 'SUBSCRIBED') { clearTimeout(to); res(); } else if (st === 'CHANNEL_ERROR' || st === 'TIMED_OUT') { clearTimeout(to); rej(new Error('Canal Supabase : ' + st)); } }); });
+    return true;
+  }
+  send(m) { try { this.ch.send({ type: 'broadcast', event: 'm', payload: m }); } catch (e) { } }
+  close() { try { this.client.removeChannel(this.ch); } catch (e) { } }
+}
+function netSend(m) { if (NET.tr) NET.tr.send(m); }
+function netRecv(m) {
+  NET.lastRx = performance.now();
+  if (m.t === 'ping') return netSend({ t: 'pong', ts: m.ts });
+  if (m.t === 'pong') { const r = performance.now() - m.ts; NET.rtt = NET.rtt * .7 + r * .3; return; }
+  if (m.t === 'bye') { NET.peer = null; NET.peerLeft = true; }
+  if (NET.onMsg) NET.onMsg(m);
+}
+async function netOpen(code, role, local) {
+  netClose(); NET.code = code; NET.role = role; NET.local = local; NET.peer = null; NET.peerLeft = false;
+  const tr = local ? new LocalTransport(code) : new SupaTransport(code); tr.cb = netRecv; await tr.open(); NET.tr = tr; NET.lastRx = performance.now();
+  clearInterval(NET.pingT); NET.pingT = setInterval(() => { netSend({ t: 'ping', ts: performance.now() }); if (!NET.peer) netSend({ t: 'hello', name: NET.name, role: NET.role }); }, 1000);
+  netSend({ t: 'hello', name: NET.name, role });
+}
+function netClose() { clearInterval(NET.pingT); if (NET.tr) { netSend({ t: 'bye' }); NET.tr.close(); } NET.tr = null; NET.peer = null; }
+
+/* ---------- salon (interface HTML par-dessus le jeu) ---------- */
+const NET_CSS = `
+#asfnet{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:50;font-family:'Chakra Petch',system-ui,sans-serif;color:#eaf2ff;pointer-events:none}
+#asfnet .pn{pointer-events:auto;width:min(760px,94vw);max-height:92vh;overflow:auto;background:rgba(8,6,22,.93);border:1.5px solid #6fe0ee;box-shadow:0 0 30px rgba(58,214,255,.35);border-radius:10px;padding:18px 20px}
+#asfnet h1{margin:0 0 4px;font:400 26px 'Bungee',sans-serif;color:#fff;text-shadow:0 0 12px #3a8aff}#asfnet h2{margin:14px 0 6px;font-size:13px;letter-spacing:2px;color:#ffd45c}
+#asfnet .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:6px 0}#asfnet input,#asfnet select{background:#120e22;border:1px solid #2b6575;color:#fff;border-radius:6px;padding:8px 10px;font:inherit;font-size:14px}
+#asfnet button{background:linear-gradient(#2a6aff,#1a3aa0);border:1px solid #7ff0ff;color:#fff;border-radius:6px;padding:9px 14px;font:700 13px inherit;letter-spacing:1px;cursor:pointer}#asfnet button.alt{background:#1a1430;border-color:#5a4a8a}#asfnet button:disabled{opacity:.4;cursor:default}
+#asfnet .code{font:400 34px 'Bungee',monospace;letter-spacing:8px;color:#7ff0ff}#asfnet .st{font-size:13px;color:#b8c8e8;min-height:18px}#asfnet .err{color:#ff7a8a}
+#asfnet .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(54px,1fr));gap:6px}#asfnet .grid div{background:#120e22;border:2px solid #2a2440;border-radius:6px;cursor:pointer;text-align:center;font-size:9px;padding:2px}
+#asfnet .grid img{width:46px;height:46px;image-rendering:pixelated;display:block;margin:auto}#asfnet .grid div.me{border-color:#3ad6ff;box-shadow:0 0 8px #3ad6ff}#asfnet .grid div.op{outline:2px dashed #ff5aa8}
+#asfnet .ready{color:#7dff6a;font-weight:700}#asfnet small{color:#8a94b8}`;
+let NET_FACES = null;
+function netFaces() { if (NET_FACES) return NET_FACES; NET_FACES = {}; CHARS.forEach(c => { try { NET_FACES[c.id] = sheetOf(c).face.toDataURL(); } catch (e) { NET_FACES[c.id] = ''; } }); return NET_FACES; }
+class NetLobby {
+  constructor(back) { this.t = 0; this.sel = { char: (NET.mySel && NET.mySel.char) || CHARS[0].id, assist: (NET.mySel && NET.mySel.assist) || CHARS[1].id, ready: false }; this.peerSel = null; this.cfgStage = NET.stageIdx ?? 1; this.cfgTime = NET.time ?? 99; this.cfgRounds = NET.rounds ?? 2; this.err = ''; this.status = ''; this.back = back; }
+  enter() {
+    Music.play('title');
+    if (!document.getElementById('asfnet-css')) { const st = document.createElement('style'); st.id = 'asfnet-css'; st.textContent = NET_CSS; document.head.appendChild(st); }
+    this.el = document.createElement('div'); this.el.id = 'asfnet'; document.body.appendChild(this.el);
+    NET.onMsg = m => this.onMsg(m); NET.scene = this;
+    if (NET.tr && NET.peer) { this.sendSel(); }
+    this.render();
+  }
+  leave() { if (this.el) this.el.remove(); this.el = null; }
+  exit() { netClose(); this.leave(); go(new MainMenu()); }
+  update() { this.t++; if (this.t % 30 === 0 && this.el) this.renderStatus(); if (Input.kBack && !document.activeElement?.closest?.('#asfnet')) this.exit(); }
+  drawWorld(gx, fxc) { swirlBg(gx, fxc, this.t); }
+  drawUI(u) { }
+  onMsg(m) {
+    if (m.t === 'hello') { const fresh = !NET.peer; NET.peer = { name: m.name || 'Joueur', role: m.role }; if (fresh) { netSend({ t: 'hello', name: NET.name, role: NET.role }); this.sendSel(); this.render(); } return; }
+    if (m.t === 'bye') { this.peerSel = null; this.status = 'L\'adversaire a quitté le salon.'; this.render(); return; }
+    if (m.t === 'sel') { this.peerSel = m; if (NET.role === 'guest' && m.stage !== undefined) { this.cfgStage = m.stage; this.cfgTime = m.time; this.cfgRounds = m.rounds; } this.render(); this.maybeStart(); return; }
+    if (m.t === 'cfg' && NET.role === 'guest') { netSend({ t: 'go' }); this.start(m); return; }
+    if (m.t === 'go' && NET.role === 'host' && this.pendingCfg) { const c = this.pendingCfg; this.pendingCfg = null; this.start(c); }
+  }
+  sendSel() { const m = { t: 'sel', char: this.sel.char, assist: this.sel.assist, ready: this.sel.ready }; if (NET.role === 'host') Object.assign(m, { stage: this.cfgStage, time: this.cfgTime, rounds: this.cfgRounds }); netSend(m); NET.mySel = Object.assign({}, this.sel); }
+  maybeStart() {
+    if (NET.role !== 'host' || !this.sel.ready || !this.peerSel || !this.peerSel.ready || this.pendingCfg) return;
+    const delay = NET.local && !window.NET_LAG ? 2 : clamp(Math.round(NET.rtt / 2 / 16.7) + 3, 3, 12);
+    const cfg = { t: 'cfg', seed: (Math.random() * 2 ** 31) | 0, stage: this.cfgStage, time: this.cfgTime, rounds: this.cfgRounds, delay, sides: [[this.sel.char, this.sel.assist], [this.peerSel.char, this.peerSel.assist]], names: [NET.name, NET.peer ? NET.peer.name : 'Joueur 2'] };
+    this.pendingCfg = cfg; netSend(cfg); this.status = 'Lancement…'; this.renderStatus();
+    clearTimeout(this.cfgRetry); this.cfgRetry = setTimeout(() => { if (this.pendingCfg) netSend(this.pendingCfg); }, 1500);
+  }
+  start(c) { clearTimeout(this.cfgRetry); NET.stageIdx = c.stage; NET.time = c.time; NET.rounds = c.rounds; this.sel.ready = false; NET.mySel = Object.assign({}, this.sel); this.leave(); go(new NetBattle(c)); }
+  async connect(create) {
+    const name = (this.q('#nname').value || 'Joueur').slice(0, 14); NET.name = name; try { localStorage.setItem('asf_name', name); } catch (e) { }
+    const local = this.q('#nlocal').checked; let code = create ? Array.from({ length: 4 }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ'[(Math.random() * 23) | 0]).join('') : (this.q('#ncode').value || '').trim().toUpperCase();
+    if (!create && code.length < 4) { this.err = 'Entre le code à 4 lettres du salon.'; return this.render(); }
+    this.err = ''; this.status = 'Connexion…'; this.render();
+    try { await netOpen(code, create ? 'host' : 'guest', local); this.status = create ? 'Salon créé ! Donne le code à ton pote.' : 'Connecté, en attente de l\'hôte…'; }
+    catch (e) { this.err = e.message || String(e); this.status = ''; netClose(); }
+    this.render();
+  }
+  q(s) { return this.el.querySelector(s); }
+  renderStatus() { const s = this.q('#nst'); if (!s) return; const ping = NET.tr && NET.peer ? ` · ping ${Math.round(NET.rtt)} ms` : ''; s.innerHTML = (this.err ? `<span class="err">${this.err}</span> ` : '') + (this.status || '') + ping; }
+  render() {
+    if (!this.el) return; const cfg = netCfg(); let h = `<div class="pn"><h1>EN LIGNE</h1><small>Combat 1 contre 1 à distance. Chaque joueur utilise les touches du JOUEUR 1 (ou sa manette).</small>`;
+    if (!NET.tr) {
+      if (!cfg.url || !cfg.key) h += `<h2>CONFIG SUPABASE</h2><div class="row"><input id="nurl" placeholder="https://xxxx.supabase.co" style="flex:2" value="${cfg.url}"><input id="nkey" placeholder="clé anon public" style="flex:3" value="${cfg.key}"><button id="nsave" class="alt">ENREGISTRER</button></div><small>Supabase → Project Settings → API. (Ou colle-les une fois pour toutes en haut du fichier, voir SUPABASE_URL.)</small>`;
+      let nm = ''; try { nm = localStorage.getItem('asf_name') || ''; } catch (e) { }
+      h += `<h2>TON PSEUDO</h2><div class="row"><input id="nname" maxlength="14" value="${NET.name || nm}" placeholder="Pseudo"></div>
+        <h2>SALON</h2><div class="row"><button id="ncreate">CRÉER UN SALON</button><span style="margin:0 6px">ou</span><input id="ncode" maxlength="4" placeholder="CODE" style="width:90px;text-transform:uppercase;letter-spacing:4px"><button id="njoin">REJOINDRE</button></div>
+        <div class="row"><label><input type="checkbox" id="nlocal"> Test local (2 onglets sur ce PC, sans Supabase)</label></div>`;
+    } else {
+      const f = netFaces(), opp = this.peerSel;
+      h += `<div class="row" style="justify-content:space-between"><div>SALON <span class="code">${NET.code}</span></div><div>${NET.peer ? `Adversaire : <b>${NET.peer.name}</b> ${opp && opp.ready ? '<span class="ready">PRÊT</span>' : ''}` : '<i>En attente d\'un adversaire…</i>'}</div></div>`;
+      const grid = (key) => `<div class="grid">${CHARS.map(c => `<div data-k="${key}" data-id="${c.id}" class="${this.sel[key] === c.id ? 'me' : ''} ${opp && opp[key] === c.id ? 'op' : ''}"><img src="${f[c.id]}">${c.name}</div>`).join('')}</div>`;
+      h += `<h2>TON COMBATTANT</h2>${grid('char')}<h2>TON ASSIST</h2>${grid('assist')}`;
+      if (NET.role === 'host') h += `<h2>ARÈNE & RÈGLES</h2><div class="row"><select id="nstage">${STAGES.map((s, i) => `<option value="${i}" ${i == this.cfgStage ? 'selected' : ''}>${s.name}</option>`).join('')}</select><select id="ntime">${[60, 99, 0].map(v => `<option value="${v}" ${v == this.cfgTime ? 'selected' : ''}>${v ? v + ' s' : '∞'}</option>`).join('')}</select><select id="nrounds">${[1, 2, 3].map(v => `<option value="${v}" ${v == this.cfgRounds ? 'selected' : ''}>${v} manche${v > 1 ? 's' : ''} gagnante${v > 1 ? 's' : ''}</option>`).join('')}</select></div>`;
+      else h += `<h2>ARÈNE</h2><div>${(STAGES[this.cfgStage] || {}).name || '—'} · ${this.cfgTime ? this.cfgTime + ' s' : '∞'} · ${this.cfgRounds} manche(s)</div>`;
+      h += `<div class="row" style="margin-top:14px"><button id="nready" ${NET.peer ? '' : 'disabled'}>${this.sel.ready ? 'ANNULER' : 'PRÊT !'}</button></div>`;
+    }
+    h += `<div class="row" style="justify-content:space-between;margin-top:10px"><div id="nst" class="st"></div><button id="nback" class="alt">RETOUR</button></div></div>`;
+    this.el.innerHTML = h; this.renderStatus();
+    const on = (s, ev, fn) => { const e = this.q(s); if (e) e.addEventListener(ev, fn); };
+    on('#nsave', 'click', () => { try { localStorage.setItem('asf_supa', JSON.stringify({ url: this.q('#nurl').value.trim(), key: this.q('#nkey').value.trim() })); } catch (e) { } this.status = 'Config enregistrée.'; this.render(); });
+    on('#ncreate', 'click', () => this.connect(true)); on('#njoin', 'click', () => this.connect(false));
+    on('#nback', 'click', () => this.exit());
+    on('#nready', 'click', () => { this.sel.ready = !this.sel.ready; this.sendSel(); this.render(); this.maybeStart(); });
+    ['#nstage', '#ntime', '#nrounds'].forEach(s => on(s, 'change', () => { this.cfgStage = +this.q('#nstage').value; this.cfgTime = +this.q('#ntime').value; this.cfgRounds = +this.q('#nrounds').value; this.sendSel(); }));
+    this.el.querySelectorAll('.grid div').forEach(d => d.addEventListener('click', () => { if (this.sel.ready) return; this.sel[d.dataset.k] = d.dataset.id; this.sendSel(); this.render(); }));
+  }
+}
+
+/* ---------- combat en ligne : lockstep à délai d'entrée ---------- */
+class NetBattle {
+  constructor(c) {
+    this.c = c; this.me = NET.role === 'host' ? 0 : 1; this.delay = c.delay; this.sim = 0; this.nextIn = c.delay; this.tick = 0; this.stall = 0; this.done = null; this.hashes = {};
+    this.rng = mulberry32(c.seed); this.simPS = [newPS(), newPS()]; this.inputs = [new Map(), new Map()];
+    for (let f = 0; f < c.delay; f++) { this.inputs[0].set(f, 0); this.inputs[1].set(f, 0); }
+    this.saved = { time: settings.time, rounds: settings.rounds }; settings.time = c.time; settings.rounds = c.rounds;
+    const side = i => ({ chars: [CHAR_BY_ID[c.sides[i][0]] || CHARS[0]], assist: CHAR_BY_ID[c.sides[i][1]] || CHARS[1], ctrl: 'human' });
+    this.withSim(() => { this.battle = new Battle({ mode: 'vs', online: true, stage: STAGES[c.stage] || STAGES[0], sides: [side(0), side(1)], onEnd: w => this.finish(w) }); });
+    NET.onMsg = m => this.onMsg(m); NET.scene = this; this.lastPeer = performance.now();
+    if (window.NET_TEST_ENERGY) this.battle.f.forEach(f => f.energy = 300);
+  }
+  enter() { this.battle.enter(); }
+  withSim(fn) {
+    const P = Input.p, F = Input.frame, pa = Input.pause, cf = Input.confirm, bk = Input.back, R = Math.random;
+    Input.p = this.simPS; Input.frame = 100000 + this.sim; Input.pause = false; Input.confirm = false; Input.back = false; Math.random = this.rng;
+    try { fn(); } finally { Input.p = P; Input.frame = F; Input.pause = pa; Input.confirm = cf; Input.back = bk; Math.random = R; }
+  }
+  localMask() { let m = 0; ACTIONS.forEach((a, i) => { if (a !== 'start' && (Input.p[0].cur[a] || Input.p[1].cur[a])) m |= 1 << i; }); return m; }
+  onMsg(m) {
+    this.lastPeer = performance.now();
+    if (m.t === 'in') { const o = 1 - this.me; m.m.forEach((v, k) => { const f = m.f + k; if (f >= this.sim) this.inputs[o].set(f, v); }); return; }
+    if (m.t === 'h') { const mine = this.hashes[m.f]; if (mine !== undefined && mine !== m.h && this.me === 1) netSend({ t: 'rs', f: m.f }); return; }
+    if (m.t === 'rs' && this.me === 0) { netSend({ t: 'snap', f: this.sim, s: this.snapshot() }); return; }
+    if (m.t === 'snap' && this.me === 1) { this.applySnap(m.s); return; }
+    if (m.t === 'quit' || m.t === 'bye') { if (!this.done) { this.done = { w: this.me, t: 0, quit: true }; } }
+    if (m.t === 'hello' && NET.lobbyAgain) { }
+  }
+  snapshot() { return this.battle.f.map(f => ['x', 'y', 'vx', 'vy', 'hp', 'energy', 'guardG', 'face', 'assistCd'].map(k => f[k])).concat([[this.battle.timer, this.battle.tf]]); }
+  applySnap(s) { const K = ['x', 'y', 'vx', 'vy', 'hp', 'energy', 'guardG', 'face', 'assistCd']; this.battle.f.forEach((f, i) => K.forEach((k, j) => { if (s[i] && s[i][j] !== undefined && s[i][j] !== null) f[k] = s[i][j]; })); if (s[2]) { this.battle.timer = s[2][0]; this.battle.tf = s[2][1]; } }
+  hash() { let h = 2166136261; const add = v => { h ^= Math.round(v * 100) | 0; h = Math.imul(h, 16777619); }; this.battle.f.forEach(f => { add(f.x); add(f.y); add(f.hp); add(f.energy); }); add(this.battle.t); add(this.battle.projs.length); return h >>> 0; }
+  stepSim() {
+    const f = this.sim;
+    for (let s = 0; s < 2; s++) { const m = this.inputs[s].get(f), ps = this.simPS[s];
+      ACTIONS.forEach((a, i) => { const v = !!(m & (1 << i)); ps.prev[a] = ps.cur[a]; ps.kbPrev[a] = ps.kb[a]; ps.kb[a] = v; ps.cur[a] = v; if (v && !ps.prev[a]) ps.buf[a] = 100000 + f; ps.rep[a] = v ? ps.rep[a] + 1 : 0; });
+      this.inputs[s].delete(f - 60); }
+    this.withSim(() => this.battle.update());
+    if (window.NET_DEBUG) { (this.dbg = this.dbg || []).push(JSON.stringify([this.sim, this.battle.f.map(f => [f.x, f.y, f.vx, f.vy, f.hp, f.energy, f.state, f.st, f.mi, f.mt]), this.battle.t, this.battle.projs.length, this.battle.cine ? this.battle.cine.t : -1, this.battle.freeze, this.battle.impact])); }
+    this.sim++;
+    if (this.sim % 60 === 0) { const h = this.hash(); this.hashes[this.sim] = h; delete this.hashes[this.sim - 600]; netSend({ t: 'h', f: this.sim, h }); }
+  }
+  update() {
+    this.tick++;
+    if (this.done) { this.done.t++; if (this.done.t > 260 || (this.done.t > 60 && Input.confirm)) this.backToLobby(); return; }
+    if (Input.kBack) { this.escT = this.escT > 0 ? -1 : 60; if (this.escT < 0) { netSend({ t: 'quit' }); this.done = { w: 1 - this.me, t: 0, quit: true, me: true }; return; } }
+    if (this.escT > 0) this.escT--;
+    // entrée locale (planifiée "delay" images plus tard)
+    if (this.nextIn <= this.sim + this.delay) { this.inputs[this.me].set(this.nextIn, this.localMask()); this.nextIn++; }
+    if (NET.local || this.tick % 2 === 0) { const f0 = Math.max(this.sim, this.nextIn - 14), arr = []; for (let f = f0; f < this.nextIn; f++) arr.push(this.inputs[this.me].get(f) || 0); netSend({ t: 'in', f: f0, m: arr }); }
+    let n = 0; while (n < 3 && this.inputs[0].has(this.sim) && this.inputs[1].has(this.sim) && !this.done) { this.stepSim(); n++; }
+    this.stall = n ? 0 : this.stall + 1;
+    if (performance.now() - this.lastPeer > 8000 && !this.done) this.done = { w: this.me, t: 0, quit: true, lost: true };
+  }
+  finish(w) { if (!this.done) this.done = { w, t: 0 }; }
+  backToLobby() { settings.time = this.saved.time; settings.rounds = this.saved.rounds; FX.clear(); go(new NetLobby(true)); }
+  drawWorld(gx, fxc) { this.battle.drawWorld(gx, fxc); }
+  drawUI(u) {
+    this.battle.drawUI(u);
+    txt(u, `EN LIGNE · ${NET.code} · ${Math.round(NET.rtt)} ms · délai ${this.delay}`, 474, 262, { font: F.px, size: 5, weight: 400, fill: '#7ff0ff', align: 'right', stroke: '#05030a', sw: 1.4 });
+    if (this.stall > 20 && !this.done) { u.fillStyle = 'rgba(0,0,0,.45)'; u.fillRect(0, 110, W, 40); txt(u, 'SYNCHRONISATION…', 240, 132, { font: F.disp, size: 14, weight: 400, fill: ['#ffffff', '#7ff0ff'], align: 'center', stroke: '#05030a', sw: 3 }); }
+    if (this.escT > 0) txt(u, 'ÉCHAP encore pour quitter', 240, 40, { font: F.ui, size: 8, fill: '#ffd45c', align: 'center', stroke: '#05030a', sw: 2 });
+    if (this.done) { const k = Math.min(1, this.done.t / 12), win = this.done.w === this.me, draw = this.done.w < 0; u.fillStyle = `rgba(0,0,0,${.55 * k})`; u.fillRect(0, 0, W, H);
+      txt(u, draw ? 'ÉGALITÉ' : win ? 'VICTOIRE !' : 'DÉFAITE', 240, 120, { font: F.disp, size: 34, weight: 400, fill: win ? ['#ffffff', '#7dff6a'] : ['#ffffff', '#ff5a7a'], align: 'center', stroke: '#05030a', sw: 4, alpha: k });
+      txt(u, this.done.lost ? 'Connexion perdue avec l\'adversaire' : this.done.quit ? (this.done.me ? 'Tu as quitté le combat' : 'L\'adversaire a quitté le combat') : 'Retour au salon…', 240, 150, { font: F.ui, size: 9, fill: '#b8c8e8', align: 'center', alpha: k }); }
+  }
+}
 /* =========================================================
    BOUCLE PRINCIPALE
    ========================================================= */
