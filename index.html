@@ -146,9 +146,19 @@ const gameCodes = new Set(['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowR
 window.addEventListener('keydown', e => {
   if (!e.repeat) { Input.down.add(e.code); Input.tap.add(e.code); Input.lastCode = e.code; Input.anyKey = true; }
   if (gameCodes.has(e.code) || e.code.startsWith('Numpad')) e.preventDefault();
+  if (!e.repeat && !(e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName))) volKey(e.code, e.key);
   AU.unlock();
 });
 window.addEventListener('keyup', e => { Input.down.delete(e.code); });
+// raccourcis volume partout (menus, combat, en ligne) : − / + et M (couper)
+let VOL_TOAST = 0, volMuted = 0;
+function setMusicVol(v) { settings.music = Math.max(0, Math.min(1, Math.round(v * 10) / 10)); try { AU.applyVol(); } catch (e) { } saveSettings(); VOL_TOAST = 90; }
+function volKey(c, k) {
+  if (k === '-' || c === 'NumpadSubtract') setMusicVol(settings.music - .1);
+  else if (k === '+' || k === '=' || c === 'NumpadAdd') setMusicVol(settings.music + .1);
+  else if (k === 'm' || k === 'M') { if (settings.music > 0) { volMuted = settings.music; setMusicVol(0); } else setMusicVol(volMuted || .45); }
+}
+function drawVolToast(u) { if (VOL_TOAST <= 0) return; VOL_TOAST--; const a = Math.min(1, VOL_TOAST / 20), v = settings.music; u.save(); u.globalAlpha = a; u.fillStyle = 'rgba(5,3,10,.8)'; u.fillRect(170, 8, 140, 22); u.fillStyle = '#2a2440'; u.fillRect(222, 17, 80, 5); u.fillStyle = '#7ff0ff'; u.fillRect(222, 17, 80 * v, 5); u.restore(); txt(u, v > 0 ? 'MUSIQUE ' + Math.round(v * 100) + '%' : 'MUSIQUE COUPÉE', 176, 21, { font: F.ui, size: 7, fill: '#ffffff', alpha: a }); }
 window.addEventListener('blur', () => Input.down.clear());
 function toGame(ev) { const r = cvs.getBoundingClientRect(); return [((ev.clientX - r.left) * DPR - OX) / SC, ((ev.clientY - r.top) * DPR - OY) / SC]; }
 cvs.addEventListener('pointermove', e => { const [x, y] = toGame(e); Input.mouse.x = x; Input.mouse.y = y; Input.mouse.moved = true; });
@@ -394,14 +404,17 @@ const Music = {
   cur: null, want: null, next: 0, timer: null, pos: { o: 0, bar: 0, st: 0 }, el: null, fileOk: true, rot: -1, duckF: 1, els: {},
   nextBattle() { this.rot = (this.rot + 1) % 3; return 'battle' + this.rot; },
   vol() { return Math.max(0, Math.min(1, settings.music * this.duckF)); },
-  duck(f) { this.duckF = f; if (this.el) this.el.volume = this.vol(); },
+  duck(f) { this.duckF = f; this.applyEl(); },
+  // volume du MP3 : el.volume + (si possible) un gain WebAudio, car iPhone/iPad ignorent el.volume
+  route(el) { if (el._g || !AU.c || !/^https?:$/.test(location.protocol)) return; try { const src = AU.c.createMediaElementSource(el), g = AU.c.createGain(); src.connect(g); g.connect(AU.c.destination); el._g = g; } catch (e) { el._g = null; } },
+  applyEl() { const el = this.el; if (!el) return; const v = this.vol(); this.route(el); if (el._g) { el._g.gain.value = v; try { el.volume = 1; } catch (e) { } } else el.volume = v; el.muted = v <= 0; },
   stopFile() { if (this.el) { try { this.el.pause(); } catch (e) { } this.el = null; } },
   playFile(n) {
     const src = MUSIC_FILES[n]; if (!src || !this.fileOk) return false;
     let el = this.els[n];
     if (!el) { try { el = new Audio(src); el.loop = true; el.preload = 'auto'; el.addEventListener('error', () => { if (this.fileOk) { this.fileOk = false; const w = this.want; this.cur = null; this.stopFile(); this.play(w, true); } }); this.els[n] = el; } catch (e) { this.fileOk = false; return false; } }
     if (this.el && this.el !== el) this.stopFile();
-    this.el = el; el.volume = this.vol();
+    this.el = el; this.applyEl();
     if (el.paused) { if (this.cur !== n) { try { el.currentTime = 0; } catch (e) { } } const pr = el.play(); if (pr && pr.catch) pr.catch(() => { }); }
     this.cur = n; this.synthOff = true; return true;
   },
@@ -7183,8 +7196,8 @@ class Options {
       { l: 'DURÉE D\'UN ROUND', v: S.time ? S.time + ' s' : '∞', ch: d => { const o = [30, 60, 99, 0]; S.time = o[(o.indexOf(S.time) + d + 4) % 4]; } },
       { l: 'DIFFICULTÉ CPU', v: ['FACILE', 'NORMALE', 'DIFFICILE', 'EXPERT'][S.diff], ch: d => S.diff = clamp(S.diff + d, 0, 3) },
       { l: 'TREMBLEMENTS D\'ÉCRAN', v: S.shake ? 'OUI' : 'NON', ch: () => S.shake = !S.shake },
-      { l: 'MUSIQUE', v: Math.round(S.music * 100) + ' %', ch: d => { S.music = clamp(Math.round((S.music + d * .1) * 10) / 10, 0, 1); AU.applyVol(); } },
-      { l: 'EFFETS SONORES', v: Math.round(S.sfx * 100) + ' %', ch: d => { S.sfx = clamp(Math.round((S.sfx + d * .1) * 10) / 10, 0, 1); AU.applyVol(); sfx('hit'); } },
+      { l: 'MUSIQUE', v: Math.round(S.music * 100) + ' %', ch: (d, w) => { S.music = w && S.music >= 1 ? 0 : clamp(Math.round((S.music + d * .1) * 10) / 10, 0, 1); AU.applyVol(); } },
+      { l: 'EFFETS SONORES', v: Math.round(S.sfx * 100) + ' %', ch: (d, w) => { S.sfx = w && S.sfx >= 1 ? 0 : clamp(Math.round((S.sfx + d * .1) * 10) / 10, 0, 1); AU.applyVol(); sfx('hit'); } },
       { l: 'TOUCHES JOUEUR 1', v: '▸', act: () => { this.remap = 0; this.rs = 0; } },
       { l: 'TOUCHES JOUEUR 2', v: '▸', act: () => { this.remap = 1; this.rs = 0; } },
       { l: 'RÉINITIALISER LES TOUCHES', v: '', act: () => { settings.keys = JSON.parse(JSON.stringify(DEFAULT_KEYS)); } },
@@ -7199,7 +7212,7 @@ class Options {
     const mi = mouseOver(rows.map((r, i) => [70, 50 + i * 19 - 8, 340, 16])); if (mi >= 0 && Input.mouse.moved) this.sel = mi; Input.mouse.moved = false;
     const r = rows[this.sel];
     if (n.x && r.ch) { r.ch(n.x); saveSettings(); sfx('move'); }
-    if (Input.confirm || (mi >= 0 && Input.mouse.click)) { if (r.act) { sfx('select'); r.act(); } else if (r.ch) { r.ch(1); sfx('move'); } saveSettings(); }
+    if (Input.confirm || (mi >= 0 && Input.mouse.click)) { if (r.act) { sfx('select'); r.act(); } else if (r.ch) { const mx = Input.mouse.x; if (mi >= 0 && Input.mouse.click && mx >= 300 && mx < 362) r.ch(-1); else if (mi >= 0 && Input.mouse.click && mx >= 362) r.ch(1); else r.ch(1, true); sfx('move'); } saveSettings(); }
     else if (Input.back) { sfx('back'); saveSettings(); go(new MainMenu()); }
   }
   updateRemap() {
@@ -7244,7 +7257,7 @@ class Options {
       txt(u, r.l, 90, y, { font: F.ui, size: 10, italic: true, fill: sel ? '#ffffff' : ['#ffe4a0', '#ff9a2a'], stroke: '#1a0800', sw: 2 });
       if (r.v) txt(u, (r.ch && sel ? '◂ ' : '') + r.v + (r.ch && sel ? ' ▸' : ''), 390, y, { font: F.ui, size: 10, italic: true, fill: sel ? '#ffffff' : '#9ff0ff', stroke: '#06101a', sw: 2, align: 'right' });
     });
-    txt(u, '↑↓ choisir · ←→ modifier · Échap retour', 240, 262, { font: F.ui, size: 6.5, fill: '#b8c8e8', align: 'center' });
+    txt(u, '↑↓ choisir · ←→ modifier (ou clic sur ◂ ▸) · Échap retour · partout : − / + / M = volume musique', 240, 262, { font: F.ui, size: 6.5, fill: '#b8c8e8', align: 'center' });
   }
 }
 
@@ -7613,7 +7626,7 @@ class SupaTransport {
   async open() {
     const c = netCfg(); if (!c.url || !c.key) throw new Error('URL / clé Supabase manquantes'); if (!/^https:\/\/[^/]+$/.test(c.url)) throw new Error('URL Supabase invalide : ' + c.url);
     await loadScript(SUPABASE_JS);
-    this.client = window.supabase.createClient(c.url, c.key, { realtime: { params: { eventsPerSecond: 60 } } });
+    this.client = window.supabase.createClient(c.url, c.key, { realtime: { params: { eventsPerSecond: 40 } } });
     this.ch = this.client.channel('asf-' + this.code, { config: { broadcast: { self: false, ack: false } } });
     this.ch.on('broadcast', { event: 'm' }, ({ payload }) => this.cb && this.cb(payload));
     await new Promise((res, rej) => { const to = setTimeout(() => rej(new Error('Connexion Supabase trop lente')), 10000); this.ch.subscribe((st, err) => { if (st === 'SUBSCRIBED') { clearTimeout(to); res(); } else if (st === 'CHANNEL_ERROR' || st === 'TIMED_OUT' || st === 'CLOSED') { clearTimeout(to); const d = err && (err.message || err.reason || JSON.stringify(err)); console.error('Supabase realtime', st, err); rej(new Error('Canal Supabase : ' + st + (d ? ' — ' + d : '') + (location.protocol === 'file:' ? ' (ouvre le jeu depuis GitHub Pages, pas en fichier local)' : ''))); } }); });
@@ -7633,7 +7646,7 @@ function netRecv(m) {
 async function netOpen(code, role, local) {
   netClose(); NET.code = code; NET.role = role; NET.local = local; NET.peer = null; NET.peerLeft = false;
   const tr = local ? new LocalTransport(code) : new SupaTransport(code); tr.cb = netRecv; await tr.open(); NET.tr = tr; NET.lastRx = performance.now();
-  clearInterval(NET.pingT); NET.pingT = setInterval(() => { netSend({ t: 'ping', ts: performance.now() }); if (!NET.peer) netSend({ t: 'hello', name: NET.name, role: NET.role }); }, 1000);
+  clearInterval(NET.pingT); NET.pingT = setInterval(() => { if (!(NET.scene instanceof NetBattle)) netSend({ t: 'ping', ts: performance.now() }); if (!NET.peer) netSend({ t: 'hello', name: NET.name, role: NET.role }); }, 1500);
   netSend({ t: 'hello', name: NET.name, role });
 }
 function netClose() { clearInterval(NET.pingT); if (NET.tr) { netSend({ t: 'bye' }); NET.tr.close(); } NET.tr = null; NET.peer = null; }
@@ -7671,17 +7684,17 @@ class NetLobby {
     if (m.t === 'bye') { this.peerSel = null; this.status = 'L\'adversaire a quitté le salon.'; this.render(); return; }
     if (m.t === 'sel') { this.peerSel = m; if (NET.role === 'guest' && m.stage !== undefined) { this.cfgStage = m.stage; this.cfgTime = m.time; this.cfgRounds = m.rounds; } this.render(); this.maybeStart(); return; }
     if (m.t === 'cfg' && NET.role === 'guest') { netSend({ t: 'go' }); this.start(m); return; }
-    if (m.t === 'go' && NET.role === 'host' && this.pendingCfg) { const c = this.pendingCfg; this.pendingCfg = null; this.start(c); }
+    if ((m.t === 'go' || m.t === 'in') && NET.role === 'host' && this.pendingCfg) { const c = this.pendingCfg; this.pendingCfg = null; this.start(c); }
   }
   sendSel() { const m = { t: 'sel', char: this.sel.char, assist: this.sel.assist, ready: this.sel.ready }; if (NET.role === 'host') Object.assign(m, { stage: this.cfgStage, time: this.cfgTime, rounds: this.cfgRounds }); netSend(m); NET.mySel = Object.assign({}, this.sel); }
   maybeStart() {
     if (NET.role !== 'host' || !this.sel.ready || !this.peerSel || !this.peerSel.ready || this.pendingCfg) return;
-    const delay = NET.local && !window.NET_LAG ? 2 : clamp(Math.round(NET.rtt / 2 / 16.7) + 3, 3, 12);
+    const delay = NET.local && !window.NET_LAG ? 2 : clamp(Math.round(NET.rtt / 2 / 16.7) + 6, 6, 16);
     const cfg = { t: 'cfg', seed: (Math.random() * 2 ** 31) | 0, stage: this.cfgStage, time: this.cfgTime, rounds: this.cfgRounds, delay, sides: [[this.sel.char, this.sel.assist], [this.peerSel.char, this.peerSel.assist]], names: [NET.name, NET.peer ? NET.peer.name : 'Joueur 2'] };
     this.pendingCfg = cfg; netSend(cfg); this.status = 'Lancement…'; this.renderStatus();
-    clearTimeout(this.cfgRetry); this.cfgRetry = setTimeout(() => { if (this.pendingCfg) netSend(this.pendingCfg); }, 1500);
+    clearInterval(this.cfgRetry); this.cfgRetry = setInterval(() => { if (this.pendingCfg && this.el) netSend(this.pendingCfg); else clearInterval(this.cfgRetry); }, 1000);
   }
-  start(c) { clearTimeout(this.cfgRetry); NET.stageIdx = c.stage; NET.time = c.time; NET.rounds = c.rounds; this.sel.ready = false; NET.mySel = Object.assign({}, this.sel); this.leave(); go(new NetBattle(c)); }
+  start(c) { clearInterval(this.cfgRetry); NET.stageIdx = c.stage; NET.time = c.time; NET.rounds = c.rounds; this.sel.ready = false; NET.mySel = Object.assign({}, this.sel); this.leave(); go(new NetBattle(c)); }
   async connect(create) {
     const name = (this.q('#nname').value || 'Joueur').slice(0, 14); NET.name = name; try { localStorage.setItem('asf_name', name); } catch (e) { }
     const local = this.q('#nlocal').checked; let code = create ? Array.from({ length: 4 }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ'[(Math.random() * 23) | 0]).join('') : (this.q('#ncode').value || '').trim().toUpperCase();
@@ -7710,12 +7723,12 @@ class NetLobby {
       else h += `<h2>ARÈNE</h2><div>${(STAGES[this.cfgStage] || {}).name || '—'} · ${this.cfgTime ? this.cfgTime + ' s' : '∞'} · ${this.cfgRounds} manche(s)</div>`;
       h += `<div class="row" style="margin-top:14px"><button id="nready" ${NET.peer ? '' : 'disabled'}>${this.sel.ready ? 'ANNULER' : 'PRÊT !'}</button></div>`;
     }
-    h += `<div class="row" style="justify-content:space-between;margin-top:10px"><div id="nst" class="st"></div><button id="nback" class="alt">RETOUR</button></div></div>`;
+    h += `<div class="row" style="justify-content:space-between;margin-top:10px"><div id="nst" class="st"></div><label style="margin-left:auto">MUSIQUE <input type="range" id="nvol" min="0" max="10" value="${Math.round(settings.music * 10)}" style="width:110px;vertical-align:middle;padding:0"></label><button id="nback" class="alt">RETOUR</button></div></div>`;
     this.el.innerHTML = h; this.renderStatus();
     const on = (s, ev, fn) => { const e = this.q(s); if (e) e.addEventListener(ev, fn); };
     on('#nsave', 'click', () => { try { localStorage.setItem('asf_supa', JSON.stringify({ url: cleanUrl(this.q('#nurl').value), key: cleanKey(this.q('#nkey').value) })); } catch (e) { } this.showCfg = false; window.supabase = undefined; this.status = 'Config enregistrée.'; this.render(); });
     on('#ncfg', 'click', () => { this.showCfg = !this.showCfg; this.render(); }); on('#ncreate', 'click', () => this.connect(true)); on('#njoin', 'click', () => this.connect(false));
-    on('#nback', 'click', () => this.exit());
+    on('#nback', 'click', () => this.exit()); on('#nvol', 'input', e => setMusicVol(+e.target.value / 10));
     on('#nready', 'click', () => { this.sel.ready = !this.sel.ready; this.sendSel(); this.render(); this.maybeStart(); });
     ['#nstage', '#ntime', '#nrounds'].forEach(s => on(s, 'change', () => { this.cfgStage = +this.q('#nstage').value; this.cfgTime = +this.q('#ntime').value; this.cfgRounds = +this.q('#nrounds').value; this.sendSel(); }));
     this.el.querySelectorAll('.grid div').forEach(d => d.addEventListener('click', () => { if (this.sel.ready) return; this.sel[d.dataset.k] = d.dataset.id; this.sendSel(); this.render(); }));
@@ -7743,7 +7756,8 @@ class NetBattle {
   localMask() { let m = 0; ACTIONS.forEach((a, i) => { if (a !== 'start' && (Input.p[0].cur[a] || Input.p[1].cur[a])) m |= 1 << i; }); return m; }
   onMsg(m) {
     this.lastPeer = performance.now();
-    if (m.t === 'in') { const o = 1 - this.me; m.m.forEach((v, k) => { const f = m.f + k; if (f >= this.sim) this.inputs[o].set(f, v); }); return; }
+    if (m.t === 'cfg' && this.me === 1) { netSend({ t: 'go' }); return; }
+    if (m.t === 'in') { if (m.ts) netSend({ t: 'pong', ts: m.ts }); if (m.s > (this.peerSim || 0)) this.peerSim = m.s; const o = 1 - this.me; m.m.forEach((v, k) => { const f = m.f + k; if (f >= this.sim) this.inputs[o].set(f, v); }); return; }
     if (m.t === 'h') { const mine = this.hashes[m.f]; if (mine !== undefined && mine !== m.h && this.me === 1) netSend({ t: 'rs', f: m.f }); return; }
     if (m.t === 'rs' && this.me === 0) { netSend({ t: 'snap', f: this.sim, s: this.snapshot() }); return; }
     if (m.t === 'snap' && this.me === 1) { this.applySnap(m.s); return; }
@@ -7761,7 +7775,7 @@ class NetBattle {
     this.withSim(() => this.battle.update());
     if (window.NET_DEBUG) { (this.dbg = this.dbg || []).push(JSON.stringify([this.sim, this.battle.f.map(f => [f.x, f.y, f.vx, f.vy, f.hp, f.energy, f.state, f.st, f.mi, f.mt]), this.battle.t, this.battle.projs.length, this.battle.cine ? this.battle.cine.t : -1, this.battle.freeze, this.battle.impact])); }
     this.sim++;
-    if (this.sim % 60 === 0) { const h = this.hash(); this.hashes[this.sim] = h; delete this.hashes[this.sim - 600]; netSend({ t: 'h', f: this.sim, h }); }
+    if (this.sim % 180 === 0) { const h = this.hash(); this.hashes[this.sim] = h; delete this.hashes[this.sim - 1800]; netSend({ t: 'h', f: this.sim, h }); }
   }
   update() {
     this.tick++;
@@ -7770,7 +7784,9 @@ class NetBattle {
     if (this.escT > 0) this.escT--;
     // entrée locale (planifiée "delay" images plus tard)
     if (this.nextIn <= this.sim + this.delay) { this.inputs[this.me].set(this.nextIn, this.localMask()); this.nextIn++; }
-    if (NET.local || this.tick % 2 === 0) { const f0 = Math.max(this.sim, this.nextIn - 14), arr = []; for (let f = f0; f < this.nextIn; f++) arr.push(this.inputs[this.me].get(f) || 0); netSend({ t: 'in', f: f0, m: arr }); }
+    // envoi groupé ~15 fois/s (limite de messages Supabase) avec redondance des 40 dernières images
+    const every = NET.local ? (window.NET_EVERY || 1) : 4;
+    if (this.tick % every === 0) { const f0 = Math.max(0, this.peerSim || 0, this.nextIn - 48), arr = []; for (let f = f0; f < this.nextIn; f++) arr.push(this.inputs[this.me].get(f) || 0); const msg = { t: 'in', f: f0, m: arr, s: this.sim }; if (this.tick % 120 === 0) msg.ts = performance.now(); netSend(msg); }
     let n = 0; while (n < 3 && this.inputs[0].has(this.sim) && this.inputs[1].has(this.sim) && !this.done) { this.stepSim(); n++; }
     this.stall = n ? 0 : this.stall + 1;
     if (performance.now() - this.lastPeer > 8000 && !this.done) this.done = { w: this.me, t: 0, quit: true, lost: true };
@@ -7832,6 +7848,7 @@ function frame(now) {
   ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.clip();
   if (scene) { try { scene.drawUI(ctx); } catch (e) { console.error(e); } }
   if (fade > 0) { ctx.fillStyle = `rgba(0,0,0,${fade})`; ctx.fillRect(0, 0, W, H); }
+  try { drawVolToast(ctx); } catch (e) { }
   ctx.restore();
   requestAnimationFrame(frame);
 }
